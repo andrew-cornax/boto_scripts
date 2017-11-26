@@ -32,32 +32,52 @@ def sha256sum(file_path):
 
 	return s.hexdigest()
 
-def backup_directory_to_glacier(glacier, vault_name, directory, glacier_metadata):
+class GlacierBackupEngine:
 
-	files_to_archive = [entry for entry in os.scandir(directory) if entry.is_file()]
+	def __init__(self, glacier, vault_name, glacier_metadata_file_path):
+		self.glacier = glacier
+		self.vault_name = vault_name
+		self.glacier_metadata_file_path = glacier_metadata_file_path
+		self.load_glacier_metadata()
 
-	archive_path = create_archive(files_to_archive)
-	archive_sum = sha256sum(archive_path)
-	archive_description = str(base64.b64encode(directory.encode('ascii')))
+	def load_glacier_metadata(self):
+		if self.glacier_metadata_file_path and os.path.exists(self.glacier_metadata_file_path):
+			with open(self.glacier_metadata_file_path, 'rb') as glacier_metadata_file:
+				self.glacier_metadata = pickle.load(glacier_metadata_file)
+		else:
+			return {}
 
-	if not directory in glacier_metadata:
-		msg = "Detected no metadata for the archive for {0} - Uploading the archive to glacier".format(directory)
-		upload_archive = True
-	elif archive_sum != glacier_metadata[directory]['sha256sum']:
-		msg = "Detected new sha256 sum of the archive for {0} - Uploading the new archive to glacier, and deleting the old one.".format(directory)
-		upload_archive = True
-	else:
-		msg = "Sha256sum of the archive for {0} has not changed, so it will not be uploaded".format(directory)
-		upload_archive = False
+	def save_glacier_metadata(self):
+		with open(self.glacier_metadata_file_path, 'wb') as glacier_metadata_file:
+			pickle.dump(self.glacier_metadata, glacier_metadata_file)
 
-	print(msg)
+	def backup_directory(self, directory):
+		"""Upload the contents of a given directory to glacier as a single tar.bz2 archive. Note that only files are archived - subdirectories are ignored."""
+		files_to_archive = [entry for entry in os.scandir(directory) if entry.is_file()]
 
-	if upload_archive:
-		glacier_upload =  glacier_uploader.upload(glacier, vault_name, archive_path, archive_description)
-		glacier_metadata[directory] = {
-			'archive_id' : glacier_upload['archiveId'],
-			'sha256sum' : archive_sum
-		}
+		archive_path = create_archive(files_to_archive)
+		archive_sum = sha256sum(archive_path)
+		archive_description = str(base64.b64encode(directory.encode('ascii')))
+
+		if not directory in self.glacier_metadata:
+			msg = "Detected no metadata for the archive for {0} - Uploading the archive to glacier".format(directory)
+			upload_archive = True
+		elif archive_sum != self.glacier_metadata[directory]['sha256sum']:
+			msg = "Detected new sha256 sum of the archive for {0} - Uploading the new archive to glacier, and deleting the old one.".format(directory)
+			upload_archive = True
+			glacier.delete_archive(vaultName=self.vault_name, archiveId=self.glacier_metadata[directory]['archive_id'])
+		else:
+			msg = "Sha256sum of the archive for {0} has not changed, so it will not be uploaded".format(directory)
+			upload_archive = False
+
+		print(msg)
+
+		if upload_archive:
+			glacier_upload = glacier_uploader.upload(self.glacier, self.vault_name, archive_path, archive_description)
+			self.glacier_metadata[directory] = {
+				'archive_id' : glacier_upload['archiveId'],
+				'sha256sum' : archive_sum
+			}
 
 
 parser = argparse.ArgumentParser(description="Backup a directory to AWS glacier")
@@ -67,25 +87,14 @@ parser.add_argument('--glacier_metadata_file_path', metavar='glacier metadata fi
 args = parser.parse_args()
 
 glacier = boto3.client('glacier')
-
-glacier_metadata = {}
-
-if args.glacier_metadata_file_path and os.path.exists(args.glacier_metadata_file_path):
-	with open(args.glacier_metadata_file_path, 'rb') as glacier_metadata_file:
-		glacier_metadata = pickle.load(glacier_metadata_file)
+glacier_backup_engine = GlacierBackupEngine(glacier, args.vault_name, args.glacier_metadata_file_path)
 
 try:
-	backup_directory_to_glacier(glacier, args.vault_name, args.directory, glacier_metadata)
+	glacier_backup_engine.backup_directory(args.directory)
 
 	for entry in scantree__(args.directory):
 		print(entry)
 		if entry.is_dir():
-			backup_directory_to_glacier(glacier, args.vault_name, entry.path, glacier_metadata)
+			glacier_backup_engine.backup_directory(entry.path)
 finally:
-	with open(args.glacier_metadata_file_path, 'wb') as glacier_metadata_file:
-		pickle.dump(glacier_metadata, glacier_metadata_file)
-
-
-#if entry found, compute its sha256 hash. If different, delete the old archive, and upload the new one. Otherwise, do nothing
-
-#before we upload.. need to check if we should.
+	glacier_backup_engine.save_glacier_metadata()
