@@ -5,7 +5,7 @@ import boto3
 import glacier_uploader
 import tarfile
 import time
-import hashlib
+from utils import sha256sum
 import pickle
 
 
